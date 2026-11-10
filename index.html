@@ -1,0 +1,162 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PoseHarvest-and-Replay — Prototype</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:20px;color:#222}
+    #viewer{width:600px;height:300px;border:1px solid #ccc;background:#fafafa;display:flex;align-items:center;justify-content:center;margin-top:10px}
+    canvas{width:100%;height:100%}
+    pre{background:#111;color:#bff;padding:10px;overflow:auto;max-height:140px}
+    label{display:block;margin-top:8px}
+    button{margin-right:6px}
+  </style>
+</head>
+<body>
+  <h2>PoseHarvest-and-Replay (prototype)</h2>
+  <div>Drop a CSV or JSON file containing pose time-series, or choose file. Expected records have a timestamp and pose (position + quaternion) in any of several common arrangements. Prototype normalizes to {t (ms), x,y,z, qx,qy,qz,qw}.</div>
+
+  <label>File: <input type="file" id="file"></label>
+  <label>Or paste JSON/CSV into textarea:</label>
+  <textarea id="paste" rows="6" style="width:100%"></textarea>
+  <div>
+    <button id="load">Load</button>
+    <button id="play">Play</button>
+    <button id="pause">Pause</button>
+    <input id="seek" type="range" min="0" max="100" value="0" style="width:40%">
+    <span id="time">0 ms</span>
+  </div>
+
+  <div id="viewer"><canvas id="c"></canvas></div>
+  <h4>Normalized sample (first 5 frames)</h4>
+  <pre id="out">No data loaded.</pre>
+
+<script>
+// Minimal parser and animator
+const fileEl = document.getElementById('file');
+const paste = document.getElementById('paste');
+const loadBtn = document.getElementById('load');
+const out = document.getElementById('out');
+const playBtn = document.getElementById('play');
+const pauseBtn = document.getElementById('pause');
+const seek = document.getElementById('seek');
+const timeLabel = document.getElementById('time');
+const canvas = document.getElementById('c');
+canvas.width = 600; canvas.height = 300; const ctx = canvas.getContext('2d');
+let frames = []; let startTime = 0; let playing = false; let playStart = 0; let animId = null;
+
+function tryParseJSON(text){ try{ return JSON.parse(text); }catch(e){ return null; } }
+
+function parseCSV(text){ // simple CSV parser: header line, comma-separated
+  const lines = text.trim().split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return null;
+  const header = lines[0].split(/,|\t/).map(h=>h.trim());
+  const rows = lines.slice(1).map(l=>l.split(/,|\t/).map(v=>v.trim()));
+  return rows.map(r=>{ const obj={}; header.forEach((h,i)=>obj[h]=r[i]); return obj; });
+}
+
+function validateAndNormalizeArray(arr){ // arr: array of objects or arrays
+  const out=[];
+  for(const item of arr){
+    let o = (Array.isArray(item)) ? null : Object.assign({}, item);
+    if(!o) continue;
+    // find timestamp field
+    const tsKeys = ['t','time','timestamp','ts','sec'];
+    let t=null;
+    for(const k of tsKeys){ if(k in o){ t=o[k]; delete o[k]; break; } }
+    if(t==null){ // maybe fields named 'frame' or first numeric column
+      const keys = Object.keys(o);
+      for(const k of keys){ if(!isNaN(Number(o[k]))){ t=o[k]; delete o[k]; break; } }
+    }
+    if(t==null) return {error:'No timestamp field found in some records.'};
+    // numeric conversion
+    t = Number(t);
+    // if timestamp is small (looks like seconds), convert to ms
+    if(t>0 && t<1e6) t = Math.round(t*1000);
+    const p = {t};
+    // position candidates
+    const px = o.x || o.pos_x || o.px || o.position_x || o['0'];
+    const py = o.y || o.pos_y || o.py || o.position_y || o['1'];
+    const pz = o.z || o.pos_z || o.pz || o.position_z || o['2'];
+    if(px!=null && py!=null && pz!=null){ p.x=Number(px); p.y=Number(py); p.z=Number(pz); }
+    // quaternion candidates
+    const qx = o.qx || o.q1 || o.q_x || o['qx'];
+    const qy = o.qy || o.q2 || o.q_y || o['qy'];
+    const qz = o.qz || o.q3 || o.q_z || o['qz'];
+    const qw = o.qw || o.q0 || o.q_w || o['qw'];
+    if(qx!=null && qy!=null && qz!=null && qw!=null){ p.qx=Number(qx); p.qy=Number(qy); p.qz=Number(qz); p.qw=Number(qw); }
+    // fallback: Euler angles (deg) -> approximate quaternion (only simple yaw used)
+    const yaw = o.yaw || o.heading;
+    if(!p.qx && yaw!=null){ const y=Number(yaw)*Math.PI/180; p.qx=0; p.qy=0; p.qz=Math.sin(y/2); p.qw=Math.cos(y/2); }
+    // basic presence check
+    if(p.x==null || p.y==null || p.z==null) return {error:'Missing position fields in some records. Found keys: '+Object.keys(o).join(',')};
+    if(p.qx==null || p.qy==null || p.qz==null || p.qw==null) {
+      // if orientation missing, fill identity
+      p.qx=0; p.qy=0; p.qz=0; p.qw=1;
+    }
+    out.push(p);
+  }
+  // sort by time
+  out.sort((a,b)=>a.t-b.t);
+  return out;
+}
+
+function loadText(text){
+  let parsed = tryParseJSON(text);
+  if(parsed==null){ // try CSV
+    const csv = parseCSV(text);
+    if(csv) parsed = csv;
+  }
+  if(parsed==null) { out.textContent = 'Unable to parse input as JSON or CSV.'; frames=[]; return; }
+  // if parsed is object with frames field
+  if(!Array.isArray(parsed)){
+    if(Array.isArray(parsed.frames)) parsed = parsed.frames;
+    else if(Array.isArray(parsed.data)) parsed = parsed.data;
+    else { out.textContent = 'JSON root is not an array; expected array of records or {frames:[...]}'; frames=[]; return; }
+  }
+  const result = validateAndNormalizeArray(parsed);
+  if(result && result.error){ out.textContent = 'Validation error: '+result.error; frames=[]; return; }
+  frames = result;
+  out.textContent = JSON.stringify(frames.slice(0,5), null, 2);
+  // setup seek
+  if(frames.length>0){ seek.min = frames[0].t; seek.max = frames[frames.length-1].t; seek.value = frames[0].t; renderAt(frames[0].t); }
+}
+
+loadBtn.onclick = ()=>{
+  const f = fileEl.files[0];
+  if(f){ const r=new FileReader(); r.onload=()=>loadText(r.result); r.readAsText(f); return; }
+  const txt = paste.value.trim(); if(!txt){ out.textContent='No input.'; return; }
+  loadText(txt);
+}
+
+fileEl.addEventListener('change', ()=>{ /* noop, handled by load */ });
+
+function renderAt(t){ if(frames.length===0) return; // find nearest
+  let i = 0; while(i+1<frames.length && frames[i+1].t<=t) i++;
+  const f = frames[Math.min(i, frames.length-1)];
+  // simple 2D projection: x->centerX + x*scale, y->centerY - z*scale, use z for vertical
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle='#222'; ctx.font='12px monospace';
+  ctx.fillText('t: '+f.t+' ms',10,16);
+  const cx = canvas.width/2, cy=canvas.height/2; const s=8;
+  ctx.fillStyle='rgba(200,60,0,0.9)';
+  ctx.beginPath(); ctx.arc(cx + f.x*s, cy - f.z*s, 6,0,Math.PI*2); ctx.fill();
+  // draw orientation as a line from center of dot
+  const vx = 20*(f.qx||0), vy = -20*(f.qz||0);
+  ctx.strokeStyle='#0066cc'; ctx.beginPath(); ctx.moveTo(cx+f.x*s, cy-f.z*s); ctx.lineTo(cx+f.x*s+vx, cy-f.z*s+vy); ctx.stroke();
+}
+
+function step(){ if(!playing || frames.length===0) return; const now = Date.now(); const elapsed = now - playStart; const target = startTime + elapsed; if(target>frames[frames.length-1].t){ // stop
+    playing=false; cancelAnimationFrame(animId); return; }
+  seek.value = target; timeLabel.textContent = target + ' ms'; renderAt(target); animId = requestAnimationFrame(step);
+}
+
+playBtn.onclick = ()=>{
+  if(frames.length===0) return; if(playing) return; playing=true; playStart = Date.now(); startTime = Number(seek.value); animId = requestAnimationFrame(step);
+}
+pauseBtn.onclick = ()=>{ playing=false; if(animId) cancelAnimationFrame(animId); };
+
+seek.oninput = ()=>{ const t = Number(seek.value); timeLabel.textContent = t + ' ms'; renderAt(t); };
+</script>
+</body>
+</html>
